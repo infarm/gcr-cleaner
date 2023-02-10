@@ -17,21 +17,59 @@ package main
 
 import (
 	"context"
-	"log"
+	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
-	"runtime"
+	"strconv"
+	"syscall"
 	"time"
 
+	"github.com/GoogleCloudPlatform/gcr-cleaner/internal/bearerkeychain"
+	"github.com/GoogleCloudPlatform/gcr-cleaner/internal/version"
+	"github.com/GoogleCloudPlatform/gcr-cleaner/pkg/gcrcleaner"
 	gcrauthn "github.com/google/go-containerregistry/pkg/authn"
 	gcrgoogle "github.com/google/go-containerregistry/pkg/v1/google"
-	"github.com/sethvargo/gcr-cleaner/pkg/gcrcleaner"
+)
+
+var (
+	stdout = os.Stdout
+	stderr = os.Stderr
+)
+
+var (
+	logLevel    = os.Getenv("GCRCLEANER_LOG")
+	concurrency = func() int64 {
+		v := os.Getenv("GCRCLEANER_CONCURRENCY")
+		if v == "" {
+			return 20
+		}
+
+		i, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			panic(fmt.Errorf("failed to parse concurrency: %w", err))
+		}
+		return i
+	}()
 )
 
 func main() {
-	// Disable timestamps in go logs because stackdriver has them already.
-	log.SetFlags(log.Flags() &^ (log.Ldate | log.Ltime))
+	logger := gcrcleaner.NewLogger(logLevel, stderr, stdout)
+
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	if err := realMain(ctx, logger); err != nil {
+		cancel()
+		logger.Fatal("server exited with error", "error", err)
+	}
+
+	logger.Info("server shutdown complete")
+}
+
+func realMain(ctx context.Context, logger *gcrcleaner.Logger) error {
+	logger.Debug("server is starting", "version", version.HumanVersion)
+	defer logger.Debug("server finished")
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -39,26 +77,20 @@ func main() {
 	}
 	addr := ":" + port
 
-	var auther gcrauthn.Authenticator
-	if token := os.Getenv("GCRCLEANER_TOKEN"); token != "" {
-		auther = &gcrauthn.Bearer{Token: token}
-	} else {
-		var err error
-		auther, err = gcrgoogle.NewEnvAuthenticator()
-		if err != nil {
-			log.Fatalf("failed to setup auther: %s", err)
-		}
-	}
+	keychain := gcrauthn.NewMultiKeychain(
+		bearerkeychain.New(os.Getenv("GCRCLEANER_TOKEN")),
+		gcrauthn.DefaultKeychain,
+		gcrgoogle.Keychain,
+	)
 
-	concurrency := runtime.NumCPU()
-	cleaner, err := gcrcleaner.NewCleaner(auther, concurrency)
+	cleaner, err := gcrcleaner.NewCleaner(keychain, logger, concurrency)
 	if err != nil {
-		log.Fatalf("failed to create cleaner: %s", err)
+		return fmt.Errorf("failed to create cleaner: %w", err)
 	}
 
 	cleanerServer, err := gcrcleaner.NewServer(cleaner)
 	if err != nil {
-		log.Fatalf("failed to create server: %s", err)
+		return fmt.Errorf("failed to create server: %w", err)
 	}
 
 	cache := gcrcleaner.NewTimerCache(5 * time.Minute)
@@ -72,23 +104,30 @@ func main() {
 		Handler: mux,
 	}
 
+	errCh := make(chan error, 1)
 	go func() {
-		log.Printf("server is listening on %s\n", port)
+		logger.Info("server is listening", "port", port)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("server exited: %s", err)
+			select {
+			case errCh <- err:
+			default:
+			}
 		}
 	}()
 
-	signalCh := make(chan os.Signal, 1)
-	signal.Notify(signalCh, os.Interrupt)
+	select {
+	case <-ctx.Done():
+	case err := <-errCh:
+		return fmt.Errorf("server exited: %w", err)
+	}
 
-	<-signalCh
-
-	log.Printf("received stop, shutting down")
+	logger.Info("server received stop, shutting down")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	if err := server.Shutdown(ctx); err != nil {
-		log.Fatalf("failed to shutdown server: %s", err)
+		return fmt.Errorf("failed to shutdown server: %w", err)
 	}
+
+	return nil
 }

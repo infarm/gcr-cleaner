@@ -20,12 +20,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"log"
 	"net/http"
-	"regexp"
 	"sort"
+	"strings"
 	"time"
+
+	"github.com/GoogleCloudPlatform/gcr-cleaner/internal/version"
 )
 
 const (
@@ -36,6 +36,7 @@ const (
 // Server is a cleaning server.
 type Server struct {
 	cleaner *Cleaner
+	logger  *Logger
 }
 
 // NewServer creates a new server for handler functions.
@@ -46,6 +47,7 @@ func NewServer(cleaner *Cleaner) (*Server, error) {
 
 	return &Server{
 		cleaner: cleaner,
+		logger:  cleaner.logger,
 	}, nil
 }
 
@@ -54,8 +56,6 @@ func NewServer(cleaner *Cleaner) (*Server, error) {
 // unless the pubsub message is malformed.
 func (s *Server) PubSubHandler(cache Cache) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		ctx := r.Context()
-
 		var m pubsubMessage
 		if err := json.NewDecoder(r.Body).Decode(&m); err != nil {
 			err = fmt.Errorf("failed to decode pubsub message: %w", err)
@@ -68,7 +68,7 @@ func (s *Server) PubSubHandler(cache Cache) http.HandlerFunc {
 		// already received.
 		msgID := m.Subscription + "/" + m.Message.ID
 		if exists := cache.Insert(msgID); exists {
-			log.Printf("already processed message %s", msgID)
+			s.logger.Info("already processed message", "id", msgID)
 			w.WriteHeader(204)
 			return
 		}
@@ -80,10 +80,13 @@ func (s *Server) PubSubHandler(cache Cache) http.HandlerFunc {
 		}
 
 		// Start a goroutine to delete the images
-		body := ioutil.NopCloser(bytes.NewReader(m.Message.Data))
+		body := io.NopCloser(bytes.NewReader(m.Message.Data))
 		go func() {
+			// Intentionally don't use the request context, since it terminates but
+			// the background job should still be processing.
+			ctx := context.Background()
 			if _, _, err := s.clean(ctx, body); err != nil {
-				log.Printf("error async: %s", err.Error())
+				s.logger.Error("failed to clean", "error", err)
 			}
 		}()
 
@@ -103,9 +106,16 @@ func (s *Server) HTTPHandler() http.HandlerFunc {
 			return
 		}
 
+		refs := make([]string, 0, 16)
+		for _, v := range deleted {
+			refs = append(refs, v...)
+		}
+		sort.Strings(refs)
+
 		b, err := json.Marshal(&cleanResp{
-			Count: len(deleted),
-			Refs:  deleted,
+			Count:      len(deleted),
+			Refs:       refs,
+			RefsByRepo: deleted,
 		})
 		if err != nil {
 			err = fmt.Errorf("failed to marshal JSON errors: %w", err)
@@ -120,13 +130,15 @@ func (s *Server) HTTPHandler() http.HandlerFunc {
 }
 
 // clean reads the given body as JSON and starts a cleaner instance.
-func (s *Server) clean(ctx context.Context, r io.ReadCloser) ([]string, int, error) {
+func (s *Server) clean(ctx context.Context, r io.ReadCloser) (map[string][]string, int, error) {
 	var p Payload
 	if err := json.NewDecoder(r).Decode(&p); err != nil {
 		return nil, 500, fmt.Errorf("failed to decode payload as JSON: %w", err)
 	}
 
-	repo := p.Repo
+	s.logger.Debug("starting clean request",
+		"version", version.HumanVersion,
+		"payload", p)
 
 	// Convert duration to a negative value, since we're about to "add" it to the
 	// since time.
@@ -136,43 +148,62 @@ func (s *Server) clean(ctx context.Context, r io.ReadCloser) ([]string, int, err
 	}
 
 	since := time.Now().UTC().Add(sub)
-	tagFilterRegexp, err := regexp.Compile(p.TagFilter)
+	tagFilter, err := BuildTagFilter(p.TagFilterAny, p.TagFilterAll)
 	if err != nil {
-		return nil, http.StatusBadRequest, fmt.Errorf("failed to parse tag_filter %q: %w", p.TagFilter, err)
+		return nil, http.StatusBadRequest, fmt.Errorf("failed to build tag filter: %w", err)
 	}
 
-	log.Printf("deleting refs for %s since %s\n", repo, since)
-
-	// Gather the repositories
-	repositories := make([]string, 0, 16)
-	repositories = append(repositories, p.Repo)
-	if p.Recursive {
-		childRepos, err := s.cleaner.ListChildRepositories(context.Background(), p.Repo)
-		if err != nil {
-			return nil, http.StatusBadRequest, fmt.Errorf("failed to list child repositories for %q: %w", p.Repo, err)
+	// Gather all the repositories.
+	repos := make([]string, 0, len(p.Repos))
+	for _, v := range p.Repos {
+		if t := strings.TrimSpace(v); t != "" {
+			repos = append(repos, t)
 		}
-		repositories = append(repositories, childRepos...)
 	}
+	if p.Recursive {
+		s.logger.Debug("gathering child repositories recursively")
+
+		allRepos, err := s.cleaner.ListChildRepositories(ctx, repos)
+		if err != nil {
+			return nil, http.StatusBadRequest, fmt.Errorf("failed to list child repositories: %w", err)
+		}
+		s.logger.Debug("recursively listed child repositories",
+			"in", repos,
+			"out", allRepos)
+
+		// This is safe because ListChildRepositories is guaranteed to include at
+		// least the list repos givenh to it.
+		repos = allRepos
+	}
+
+	s.logger.Info("deleting refs",
+		"since", since,
+		"repos", repos)
 
 	// Do the deletion.
-	deleted := make([]string, 0, len(repositories))
-	for _, repo := range repositories {
-		childrenDeleted, err := s.cleaner.Clean(repo, since, p.AllowTagged, p.Keep, tagFilterRegexp, p.DryRun)
+	deleted := make(map[string][]string, len(repos))
+	for _, repo := range repos {
+		s.logger.Info("deleting refs for repo", "repo", repo)
+
+		childrenDeleted, err := s.cleaner.Clean(ctx, repo, since, p.Keep, tagFilter, p.DryRun)
 		if err != nil {
 			return nil, http.StatusBadRequest, fmt.Errorf("failed to clean repo %q: %w", repo, err)
 		}
-		deleted = append(deleted, childrenDeleted...)
+
+		if len(childrenDeleted) > 0 {
+			s.logger.Info("deleted refs", "repo", repo, "refs", childrenDeleted)
+			deleted[repo] = append(deleted[repo], childrenDeleted...)
+		}
 	}
 
-	// Sort results
-	sort.Strings(deleted)
+	s.logger.Info("deleted refs", "refs", deleted)
 
 	return deleted, http.StatusOK, nil
 }
 
 // handleError returns a JSON-formatted error message
 func (s *Server) handleError(w http.ResponseWriter, err error, status int) {
-	log.Printf("error %d: %s", status, err.Error())
+	s.logger.Error(err.Error(), "error", err)
 
 	b, err := json.Marshal(&errorResp{Error: err.Error()})
 	if err != nil {
@@ -188,22 +219,27 @@ func (s *Server) handleError(w http.ResponseWriter, err error, status int) {
 
 // Payload is the expected incoming payload format.
 type Payload struct {
-	// Repo is the name of the repo in the format gcr.io/foo/bar
-	Repo string `json:"repo"`
+	// Repos is the list of repositories to clean.
+	Repos sortedStringSlice `json:"repos"`
 
 	// Grace is a time.Duration value indicating how much grade period should be
 	// given to new, untagged layers. The default is no grace.
 	Grace duration `json:"grace"`
 
-	// AllowTagged is a Boolean value determine if tagged images are allowed
-	// to be deleted.
-	AllowTagged bool `json:"allow_tagged"`
-
 	// Keep is the minimum number of images to keep.
-	Keep int `json:"keep"`
+	Keep int64 `json:"keep"`
 
-	// TagFilter is the tags pattern to be allowed removing.
-	TagFilter string `json:"tag_filter"`
+	// TagFilterAny is the tags pattern to be allowed removing. If given, any
+	// image with at least one tag that matches this given regular expression will
+	// be deleted. The image will be deleted even if it has other tags that do not
+	// match the given regular expression.
+	TagFilterAny string `json:"tag_filter_any"`
+
+	// TagFilterAll is the tags pattern to be allowed removing. If given, any
+	// image where all tags match this given regular expression will be deleted.
+	// The image will not be delete if it has other tags that do not match the
+	// given regular expression.
+	TagFilterAll string `json:"tag_filter_all"`
 
 	// DryRun instructs the server to not perform actual cleaning. The response
 	// will include repositories that would have been deleted.
@@ -222,12 +258,62 @@ type pubsubMessage struct {
 }
 
 type cleanResp struct {
-	Count int      `json:"count"`
-	Refs  []string `json:"refs"`
+	Count      int                 `json:"count"`
+	Refs       []string            `json:"refs"`
+	RefsByRepo map[string][]string `json:"refs_by_repo"`
 }
 
 type errorResp struct {
 	Error string `json:"error"`
+}
+
+type sortedStringSlice []string
+
+func (s sortedStringSlice) MarshalJSON() ([]byte, error) {
+	return json.Marshal([]string(s))
+}
+
+func (s *sortedStringSlice) UnmarshalJSON(b []byte) error {
+	var v any
+	if err := json.Unmarshal(b, &v); err != nil {
+		return err
+	}
+
+	m := make(map[string]struct{}, 4)
+
+	switch val := v.(type) {
+	case string:
+		if t := strings.TrimSpace(val); t != "" {
+			m[t] = struct{}{}
+		}
+	case []any:
+		for i, v := range val {
+			s, ok := v.(string)
+			if !ok {
+				return fmt.Errorf("list must contain only strings (got %T at index %d)", v, i)
+			}
+			if t := strings.TrimSpace(s); t != "" {
+				m[t] = struct{}{}
+			}
+		}
+	case []string:
+		for _, v := range val {
+			if t := strings.TrimSpace(v); t != "" {
+				m[t] = struct{}{}
+			}
+		}
+	default:
+		return fmt.Errorf("invalid list type %T", val)
+	}
+
+	list := make([]string, 0, len(m))
+	for v := range m {
+		list = append(list, v)
+	}
+	sort.Strings(list)
+	*s = list
+
+	return nil
 }
 
 type duration time.Duration
@@ -237,7 +323,7 @@ func (d duration) MarshalJSON() ([]byte, error) {
 }
 
 func (d *duration) UnmarshalJSON(b []byte) error {
-	var v interface{}
+	var v any
 	if err := json.Unmarshal(b, &v); err != nil {
 		return err
 	}

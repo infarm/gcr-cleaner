@@ -21,49 +21,81 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"regexp"
-	"runtime"
 	"sort"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/GoogleCloudPlatform/gcr-cleaner/internal/bearerkeychain"
+	"github.com/GoogleCloudPlatform/gcr-cleaner/internal/version"
+	"github.com/GoogleCloudPlatform/gcr-cleaner/pkg/gcrcleaner"
 	gcrauthn "github.com/google/go-containerregistry/pkg/authn"
 	gcrgoogle "github.com/google/go-containerregistry/pkg/v1/google"
-	"github.com/hashicorp/go-multierror"
-	"github.com/sethvargo/gcr-cleaner/pkg/gcrcleaner"
 )
 
 var (
 	stdout = os.Stdout
 	stderr = os.Stderr
+)
 
+var (
+	logLevel = os.Getenv("GCRCLEANER_LOG")
+)
+
+var (
 	reposMap = make(map[string]struct{}, 4)
 
 	tokenPtr       = flag.String("token", os.Getenv("GCRCLEANER_TOKEN"), "Authentication token")
 	recursivePtr   = flag.Bool("recursive", false, "Clean all sub-repositories under the -repo root")
 	gracePtr       = flag.Duration("grace", 0, "Grace period")
-	allowTaggedPtr = flag.Bool("allow-tagged", false, "Delete tagged images")
-	keepPtr        = flag.Int("keep", 0, "Minimum to keep")
-	tagFilterPtr   = flag.String("tag-filter", "", "Tags pattern to clean")
+	tagFilterAny   = flag.String("tag-filter-any", "", "Delete images where any tag matches this regular expression")
+	tagFilterAll   = flag.String("tag-filter-all", "", "Delete images where all tags match this regular expression")
+	keepPtr        = flag.Int64("keep", 0, "Minimum to keep")
 	dryRunPtr      = flag.Bool("dry-run", false, "Do a noop on delete api call")
+	concurrencyPtr = flag.Int64("concurrency", 20, "Concurrent requests (defaults to number of CPUs)")
+	versionPtr     = flag.Bool("version", false, "Print version information and exit")
 )
 
 func main() {
+	logger := gcrcleaner.NewLogger(logLevel, stderr, stdout)
+
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
 	flag.Func("repo", "Repository name", func(s string) error {
 		parts := strings.Split(s, ",")
 		for _, p := range parts {
-			reposMap[strings.TrimSpace(p)] = struct{}{}
+			if t := strings.TrimSpace(p); t != "" {
+				reposMap[t] = struct{}{}
+			}
 		}
 		return nil
 	})
 
+	flag.Usage = func() {
+		w := flag.CommandLine.Output()
+		fmt.Fprintf(w, "Usage of %s:\n\n", os.Args[0])
+		fmt.Fprintf(w, "  Deletes untagged or stale images from a Docker registry.\n\n")
+		fmt.Fprintf(w, "Options:\n\n")
+
+		flag.VisitAll(func(f *flag.Flag) {
+			if strings.HasPrefix(f.Usage, "DEPRECATED") {
+				return
+			}
+
+			fmt.Fprintf(w, "  -%v\n", f.Name)
+			fmt.Fprintf(w, "      %s\n\n", f.Usage)
+		})
+	}
+
 	flag.Parse()
 
-	if err := realMain(ctx); err != nil {
+	if *versionPtr {
+		fmt.Fprintf(stderr, "%s\n", version.HumanVersion)
+		os.Exit(0)
+	}
+
+	if err := realMain(ctx, logger); err != nil {
 		cancel()
 
 		fmt.Fprintf(stderr, "%s\n", err)
@@ -71,7 +103,10 @@ func main() {
 	}
 }
 
-func realMain(ctx context.Context) error {
+func realMain(ctx context.Context, logger *gcrcleaner.Logger) error {
+	logger.Debug("cli is starting", "version", version.HumanVersion)
+	defer logger.Debug("cli finished")
+
 	if args := flag.Args(); len(args) > 0 {
 		return fmt.Errorf("expected zero arguments, got %d: %q", len(args), args)
 	}
@@ -86,29 +121,18 @@ func realMain(ctx context.Context) error {
 	}
 	sort.Strings(repos)
 
-	if !*allowTaggedPtr && *tagFilterPtr != "" {
-		return fmt.Errorf("-allow-tagged must be true when -tag-filter is declared")
-	}
-
-	tagFilterRegexp, err := regexp.Compile(*tagFilterPtr)
+	tagFilter, err := gcrcleaner.BuildTagFilter(*tagFilterAny, *tagFilterAll)
 	if err != nil {
-		return fmt.Errorf("failed to parse -tag-filter: %w", err)
+		return fmt.Errorf("failed to parse tag filter: %w", err)
 	}
 
-	// Try to find the "best" authentication.
-	var auther gcrauthn.Authenticator
-	if *tokenPtr != "" {
-		auther = &gcrauthn.Bearer{Token: *tokenPtr}
-	} else {
-		var err error
-		auther, err = gcrgoogle.NewEnvAuthenticator()
-		if err != nil {
-			return fmt.Errorf("failed to setup auther: %w", err)
-		}
-	}
+	keychain := gcrauthn.NewMultiKeychain(
+		bearerkeychain.New(*tokenPtr),
+		gcrauthn.DefaultKeychain,
+		gcrgoogle.Keychain,
+	)
 
-	concurrency := runtime.NumCPU()
-	cleaner, err := gcrcleaner.NewCleaner(auther, concurrency)
+	cleaner, err := gcrcleaner.NewCleaner(keychain, logger, *concurrencyPtr)
 	if err != nil {
 		return fmt.Errorf("failed to create cleaner: %w", err)
 	}
@@ -121,15 +145,21 @@ func realMain(ctx context.Context) error {
 	}
 	since := time.Now().UTC().Add(sub)
 
-	// Gather the repositories
+	// Gather the repositories.
 	if *recursivePtr {
-		for _, repo := range repos {
-			childRepos, err := cleaner.ListChildRepositories(ctx, repo)
-			if err != nil {
-				return err
-			}
-			repos = append(repos, childRepos...)
+		logger.Debug("gathering child repositories recursively")
+
+		allRepos, err := cleaner.ListChildRepositories(ctx, repos)
+		if err != nil {
+			return err
 		}
+		logger.Debug("recursively listed child repositories",
+			"in", repos,
+			"out", allRepos)
+
+		// This is safe because ListChildRepositories is guaranteed to include at
+		// least the list repos given to it.
+		repos = allRepos
 	}
 
 	// Log dry-run mode.
@@ -138,16 +168,16 @@ func realMain(ctx context.Context) error {
 			"actually be cleaned!\n\n")
 	}
 
-	fmt.Fprintf(stdout, "Deleting refs since %s on %d repo(s)...\n\n",
+	fmt.Fprintf(stdout, "Deleting refs older than %s on %d repo(s)...\n\n",
 		since.Format(time.RFC3339), len(repos))
 
 	// Do the deletion.
-	var result *multierror.Error
+	var errs []error
 	for i, repo := range repos {
 		fmt.Fprintf(stdout, "%s\n", repo)
-		deleted, err := cleaner.Clean(repo, since, *allowTaggedPtr, *keepPtr, tagFilterRegexp, *dryRunPtr)
+		deleted, err := cleaner.Clean(ctx, repo, since, *keepPtr, tagFilter, *dryRunPtr)
 		if err != nil {
-			result = multierror.Append(result, err)
+			errs = append(errs, err)
 		}
 
 		if len(deleted) > 0 {
@@ -162,5 +192,6 @@ func realMain(ctx context.Context) error {
 			fmt.Fprintf(stdout, "\n")
 		}
 	}
-	return result.ErrorOrNil()
+
+	return gcrcleaner.ErrsToError(errs)
 }
